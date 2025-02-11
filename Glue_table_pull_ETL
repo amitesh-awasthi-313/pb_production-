@@ -1,0 +1,80 @@
+import sys
+import boto3
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# function to remove data table files under table_folder_key
+def remove_table_data_files(bucket_name, table_folder_key):
+    """Remove table data files after the gorse api push."""
+    s3 = boto3.client('s3')
+    response = s3.list_objects_v2(Bucket=bucket_name, Prefix=table_folder_key)
+    
+    # Check if the folder contains any objects
+    if 'Contents' in response:
+        # Prepare a list of objects to delete
+        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+        
+        # Perform the delete operation
+        delete_response = s3.delete_objects(
+            Bucket=bucket_name,
+            Delete={'Objects': objects_to_delete}
+        )
+        
+        # Print the response (or handle as needed)
+        print(f"Deleted {len(delete_response['Deleted'])} objects from {bucket_name}")
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# table folder location for matomo_log_media
+s3_bucket = "pb-etl-athena"
+s3_table_folder = "analytics_etl/matomo_log_media/"
+s3_sink_path = "s3://" + s3_bucket + "/" + s3_table_folder
+athenaTableName = "matomo_log_media"
+athenaDatabaseName = "analyticsdatabase"
+
+#remove previous data table files (since it is full master sync)
+# prefix shall not start from '/'
+remove_table_data_files(s3_bucket, s3_table_folder)
+
+# Create the query to get data after the last execution time
+incremental_query = """
+SELECT * FROM matomo_log_media 
+WHERE server_time = (
+    SELECT DISTINCT MAX(server_time) as last_execution_time 
+    FROM matomo_log_media
+)
+"""
+
+# Script generated for node MySQL
+MySQL_node1739186650508 = glueContext.create_dynamic_frame.from_options(
+    connection_type = "mysql",
+    connection_options = {
+        "useConnectionProperties": "true",
+        "dbtable": "matomo_log_media",
+        "connectionName": "matomo  connection",
+        "sampleQuery": incremental_query
+    },
+    transformation_ctx = "MySQL_node1739186650508"
+)
+
+AmazonS3_node1739186650508 = glueContext.getSink(
+    path=s3_sink_path, 
+    connection_type="s3", 
+    updateBehavior="LOG", 
+    partitionKeys=[], 
+    enableUpdateCatalog=True, 
+    transformation_ctx="AmazonS3_node1739186650508"
+)
+AmazonS3_node1739186650508.setCatalogInfo(catalogDatabase=athenaDatabaseName,catalogTableName=athenaTableName)
+AmazonS3_node1739186650508.setFormat("glueparquet", compression="snappy")
+AmazonS3_node1739186650508.writeFrame(MySQL_node1739186650508)
+
+job.commit()
